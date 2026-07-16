@@ -18,7 +18,7 @@ import (
 
 const (
 	solverUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-	maxConcurrency  = 1
+	maxConcurrency  = 2
 )
 
 var semaphore = make(chan struct{}, maxConcurrency)
@@ -153,7 +153,7 @@ func solve3DS(redirectURL, proxyURL string) (resp SolveResponse) {
 	taskCtx, cancelTask := chromedp.NewContext(allocCtx)
 	defer cancelTask()
 
-	browserCtx, cancelBrowser := context.WithTimeout(taskCtx, 15*time.Second)
+	browserCtx, cancelBrowser := context.WithTimeout(taskCtx, 10*time.Second)
 	defer cancelBrowser()
 
 	navigateErr := chromedp.Run(browserCtx,
@@ -173,12 +173,12 @@ func solve3DS(redirectURL, proxyURL string) (resp SolveResponse) {
 		_ = chromedp.Run(browserCtx, chromedp.Navigate(redirectURL))
 	}
 
-	waitCtx, cancelWait := context.WithTimeout(browserCtx, 8*time.Second)
+	waitCtx, cancelWait := context.WithTimeout(browserCtx, 6*time.Second)
 	defer cancelWait()
 
 	_ = chromedp.Run(waitCtx,
 		chromedp.ActionFunc(func(pollCtx context.Context) error {
-			deadline := time.Now().Add(7 * time.Second)
+			deadline := time.Now().Add(5 * time.Second)
 			for time.Now().Before(deadline) {
 				select {
 				case <-pollCtx.Done():
@@ -190,7 +190,6 @@ func solve3DS(redirectURL, proxyURL string) (resp SolveResponse) {
 				_ = chromedp.Run(pollCtx, chromedp.Location(&currentURL))
 
 				if !strings.Contains(currentURL, "pg_router") && !strings.Contains(currentURL, "authenticate") {
-					time.Sleep(500 * time.Millisecond)
 					var pageText string
 					_ = chromedp.Run(pollCtx, chromedp.Text("body", &pageText, chromedp.ByQuery))
 					resp.PageText = strings.TrimSpace(pageText)
@@ -203,7 +202,7 @@ func solve3DS(redirectURL, proxyURL string) (resp SolveResponse) {
 					return nil
 				}
 
-				time.Sleep(500 * time.Millisecond)
+				time.Sleep(300 * time.Millisecond)
 			}
 			return nil
 		}),
