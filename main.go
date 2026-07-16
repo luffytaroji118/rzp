@@ -3,18 +3,25 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/chromedp/cdproto/network"
 	"github.com/chromedp/chromedp"
 )
 
-const solverUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+const (
+	solverUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+	maxConcurrency  = 1
+)
+
+var semaphore = make(chan struct{}, maxConcurrency)
 
 // SolveRequest is the JSON body sent to the solver.
 type SolveRequest struct {
@@ -41,11 +48,24 @@ func main() {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 	})
-	mux.HandleFunc("/solve", handleSolve)
+	mux.HandleFunc("/solve", recoveryMiddleware(handleSolve))
 
-	log.Printf("Razorpay 3DS Solver listening on :%s", port)
+	log.Printf("Razorpay 3DS Solver listening on :%s (max concurrency: %d)", port, maxConcurrency)
 	if err := http.ListenAndServe(":"+port, mux); err != nil {
 		log.Fatalf("server failed: %v", err)
+	}
+}
+
+func recoveryMiddleware(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		defer func() {
+			if rec := recover(); rec != nil {
+				errMsg := fmt.Sprintf("panic recovered: %v", rec)
+				log.Printf("PANIC: %s", errMsg)
+				writeJSON(w, http.StatusInternalServerError, SolveResponse{Error: errMsg})
+			}
+		}()
+		next(w, r)
 	}
 }
 
@@ -72,6 +92,14 @@ func handleSolve(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	select {
+	case semaphore <- struct{}{}:
+	case <-r.Context().Done():
+		writeJSON(w, http.StatusServiceUnavailable, SolveResponse{Error: "request cancelled before acquiring slot"})
+		return
+	}
+	defer func() { <-semaphore }()
+
 	result := solve3DS(req.URL, req.Proxy)
 	writeJSON(w, http.StatusOK, result)
 }
@@ -82,12 +110,13 @@ func writeJSON(w http.ResponseWriter, status int, v interface{}) {
 	json.NewEncoder(w).Encode(v)
 }
 
-// solve3DS opens the 3DS redirect URL in a headless browser, waits for the
-// bank page to process, reads the final page text, and determines if the
-// payment was charged (frictionless 3DS).
-func solve3DS(redirectURL, proxyURL string) SolveResponse {
-	resp := SolveResponse{}
+var (
+	allocCtx   context.Context
+	allocCancel context.CancelFunc
+	allocOnce  sync.Once
+)
 
+func initAllocator() {
 	opts := append(chromedp.DefaultExecAllocatorOptions[:],
 		chromedp.Flag("headless", true),
 		chromedp.Flag("no-sandbox", true),
@@ -104,25 +133,32 @@ func solve3DS(redirectURL, proxyURL string) SolveResponse {
 		opts = append(opts, chromedp.ExecPath(chromePath))
 	}
 
-	if proxyURL != "" {
-		opts = append(opts, chromedp.ProxyServer(proxyURL))
-	}
+	allocCtx, allocCancel = chromedp.NewExecAllocator(context.Background(), opts...)
+}
 
-	allocCtx, cancel := chromedp.NewExecAllocator(context.Background(), opts...)
-	defer cancel()
+// solve3DS opens the 3DS redirect URL in a headless browser, waits for the
+// bank page to process, reads the final page text, and determines if the
+// payment was charged (frictionless 3DS).
+func solve3DS(redirectURL, proxyURL string) (resp SolveResponse) {
+	defer func() {
+		if rec := recover(); rec != nil {
+			errMsg := fmt.Sprintf("chromedp panic recovered: %v", rec)
+			log.Printf("PANIC in solve3DS: %s", errMsg)
+			resp.Error = errMsg
+		}
+	}()
 
-	browserCtx, cancelBrowser := context.WithTimeout(allocCtx, 25*time.Second)
-	defer cancelBrowser()
+	allocOnce.Do(initAllocator)
 
-	taskCtx, cancelTask := chromedp.NewContext(browserCtx)
+	taskCtx, cancelTask := chromedp.NewContext(allocCtx)
 	defer cancelTask()
 
-	// Navigate to the 3DS redirect URL
-	navigateErr := chromedp.Run(taskCtx,
+	browserCtx, cancelBrowser := context.WithTimeout(taskCtx, 25*time.Second)
+	defer cancelBrowser()
+
+	navigateErr := chromedp.Run(browserCtx,
 		chromedp.ActionFunc(func(ctx context.Context) error {
-			if err := network.Enable().Do(ctx); err != nil {
-				return nil
-			}
+			network.Enable().Do(ctx)
 			return nil
 		}),
 		chromedp.Navigate(redirectURL),
@@ -134,32 +170,29 @@ func solve3DS(redirectURL, proxyURL string) SolveResponse {
 			resp.ClosedEarly = true
 			return resp
 		}
-		_ = chromedp.Run(taskCtx, chromedp.Navigate(redirectURL))
+		_ = chromedp.Run(browserCtx, chromedp.Navigate(redirectURL))
 	}
 
-	// Wait for bank page to process (up to 10s)
-	// Frictionless 3DS will auto-redirect back to Razorpay with a signature
-	waitCtx, cancelWait := context.WithTimeout(taskCtx, 12*time.Second)
+	waitCtx, cancelWait := context.WithTimeout(browserCtx, 12*time.Second)
 	defer cancelWait()
 
 	_ = chromedp.Run(waitCtx,
-		chromedp.ActionFunc(func(ctx context.Context) error {
+		chromedp.ActionFunc(func(pollCtx context.Context) error {
 			deadline := time.Now().Add(10 * time.Second)
 			for time.Now().Before(deadline) {
 				select {
-				case <-ctx.Done():
-					return ctx.Err()
+				case <-pollCtx.Done():
+					return pollCtx.Err()
 				default:
 				}
 
 				var currentURL string
-				_ = chromedp.Run(ctx, chromedp.Location(&currentURL))
+				_ = chromedp.Run(pollCtx, chromedp.Location(&currentURL))
 
-				// If redirected away from pg_router, bank processed it
 				if !strings.Contains(currentURL, "pg_router") && !strings.Contains(currentURL, "authenticate") {
 					time.Sleep(500 * time.Millisecond)
 					var pageText string
-					_ = chromedp.Run(ctx, chromedp.Text("body", &pageText, chromedp.ByQuery))
+					_ = chromedp.Run(pollCtx, chromedp.Text("body", &pageText, chromedp.ByQuery))
 					resp.PageText = strings.TrimSpace(pageText)
 					lower := strings.ToLower(pageText)
 					if strings.Contains(lower, "razorpay_signature") ||
@@ -176,10 +209,9 @@ func solve3DS(redirectURL, proxyURL string) SolveResponse {
 		}),
 	)
 
-	// Read final page text if not already captured
 	if resp.PageText == "" {
 		var pageText string
-		err := chromedp.Run(taskCtx, chromedp.Text("body", &pageText, chromedp.ByQuery))
+		err := chromedp.Run(browserCtx, chromedp.Text("body", &pageText, chromedp.ByQuery))
 		if err != nil {
 			errStr := err.Error()
 			if strings.Contains(errStr, "Target closed") || strings.Contains(errStr, "browser has been closed") {
