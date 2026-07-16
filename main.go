@@ -94,8 +94,8 @@ func handleSolve(w http.ResponseWriter, r *http.Request) {
 
 	select {
 	case semaphore <- struct{}{}:
-	case <-r.Context().Done():
-		writeJSON(w, http.StatusServiceUnavailable, SolveResponse{Error: "request cancelled before acquiring slot"})
+	default:
+		writeJSON(w, http.StatusServiceUnavailable, SolveResponse{Error: "busy"})
 		return
 	}
 	defer func() { <-semaphore }()
@@ -153,7 +153,7 @@ func solve3DS(redirectURL, proxyURL string) (resp SolveResponse) {
 	taskCtx, cancelTask := chromedp.NewContext(allocCtx)
 	defer cancelTask()
 
-	browserCtx, cancelBrowser := context.WithTimeout(taskCtx, 25*time.Second)
+	browserCtx, cancelBrowser := context.WithTimeout(taskCtx, 15*time.Second)
 	defer cancelBrowser()
 
 	navigateErr := chromedp.Run(browserCtx,
@@ -173,12 +173,12 @@ func solve3DS(redirectURL, proxyURL string) (resp SolveResponse) {
 		_ = chromedp.Run(browserCtx, chromedp.Navigate(redirectURL))
 	}
 
-	waitCtx, cancelWait := context.WithTimeout(browserCtx, 12*time.Second)
+	waitCtx, cancelWait := context.WithTimeout(browserCtx, 8*time.Second)
 	defer cancelWait()
 
 	_ = chromedp.Run(waitCtx,
 		chromedp.ActionFunc(func(pollCtx context.Context) error {
-			deadline := time.Now().Add(10 * time.Second)
+			deadline := time.Now().Add(7 * time.Second)
 			for time.Now().Before(deadline) {
 				select {
 				case <-pollCtx.Done():
