@@ -9,7 +9,6 @@ import (
 	"net/http"
 	"os"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/chromedp/cdproto/network"
@@ -110,13 +109,7 @@ func writeJSON(w http.ResponseWriter, status int, v interface{}) {
 	json.NewEncoder(w).Encode(v)
 }
 
-var (
-	allocCtx   context.Context
-	allocCancel context.CancelFunc
-	allocOnce  sync.Once
-)
-
-func initAllocator() {
+func buildAllocatorOpts() []chromedp.ExecAllocatorOption {
 	opts := append(chromedp.DefaultExecAllocatorOptions[:],
 		chromedp.Flag("headless", true),
 		chromedp.Flag("no-sandbox", true),
@@ -125,6 +118,8 @@ func initAllocator() {
 		chromedp.Flag("disable-blink-features", "AutomationControlled"),
 		chromedp.Flag("disable-gpu", true),
 		chromedp.Flag("ignore-certificate-errors", true),
+		chromedp.Flag("disable-extensions", true),
+		chromedp.Flag("disable-background-networking", true),
 		chromedp.WindowSize(1366, 768),
 		chromedp.UserAgent(solverUserAgent),
 	)
@@ -132,13 +127,24 @@ func initAllocator() {
 	if chromePath := findChrome(); chromePath != "" {
 		opts = append(opts, chromedp.ExecPath(chromePath))
 	}
-
-	allocCtx, allocCancel = chromedp.NewExecAllocator(context.Background(), opts...)
+	return opts
 }
 
 // solve3DS opens the 3DS redirect URL in a headless browser, waits for the
 // bank page to process, reads the final page text, and determines if the
 // payment was charged (frictionless 3DS).
+//
+// The 3DS flow has multiple phases:
+//  1. Razorpay "Loading Bank page…" — redirect to bank in progress
+//  2. Bank 3DS page — frictionless auto-approves or shows OTP challenge
+//  3. Redirect back to Razorpay — success or failure page
+//
+// We poll for up to 35 seconds, checking both URL and page text at each
+// iteration. We exit early on definitive success/failure indicators.
+//
+// A fresh Chrome allocator is created per request to avoid the
+// "close of closed channel" panic that occurs when a shared
+// allocator is used by concurrent goroutines.
 func solve3DS(redirectURL, proxyURL string) (resp SolveResponse) {
 	defer func() {
 		if rec := recover(); rec != nil {
@@ -148,12 +154,16 @@ func solve3DS(redirectURL, proxyURL string) (resp SolveResponse) {
 		}
 	}()
 
-	allocOnce.Do(initAllocator)
+	allocCtx, cancelAlloc := chromedp.NewExecAllocator(
+		context.Background(),
+		buildAllocatorOpts()...,
+	)
+	defer cancelAlloc()
 
 	taskCtx, cancelTask := chromedp.NewContext(allocCtx)
 	defer cancelTask()
 
-	browserCtx, cancelBrowser := context.WithTimeout(taskCtx, 15*time.Second)
+	browserCtx, cancelBrowser := context.WithTimeout(taskCtx, 40*time.Second)
 	defer cancelBrowser()
 
 	navigateErr := chromedp.Run(browserCtx,
@@ -173,12 +183,15 @@ func solve3DS(redirectURL, proxyURL string) (resp SolveResponse) {
 		_ = chromedp.Run(browserCtx, chromedp.Navigate(redirectURL))
 	}
 
-	waitCtx, cancelWait := context.WithTimeout(browserCtx, 10*time.Second)
+	waitCtx, cancelWait := context.WithTimeout(browserCtx, 37*time.Second)
 	defer cancelWait()
 
 	_ = chromedp.Run(waitCtx,
 		chromedp.ActionFunc(func(pollCtx context.Context) error {
-			deadline := time.Now().Add(9 * time.Second)
+			deadline := time.Now().Add(36 * time.Second)
+			leftPgRouter := false
+			leftPgRouterTime := time.Time{}
+
 			for time.Now().Before(deadline) {
 				select {
 				case <-pollCtx.Done():
@@ -189,20 +202,60 @@ func solve3DS(redirectURL, proxyURL string) (resp SolveResponse) {
 				var currentURL string
 				_ = chromedp.Run(pollCtx, chromedp.Location(&currentURL))
 
-				if !strings.Contains(currentURL, "pg_router") && !strings.Contains(currentURL, "authenticate") {
-					var pageText string
-					_ = chromedp.Run(pollCtx, chromedp.Text("body", &pageText, chromedp.ByQuery))
-					resp.PageText = strings.TrimSpace(pageText)
-					lower := strings.ToLower(pageText)
+				var pageText string
+				_ = chromedp.Run(pollCtx, chromedp.Text("body", &pageText, chromedp.ByQuery))
+				pageText = strings.TrimSpace(pageText)
+				lower := strings.ToLower(pageText)
+
+				if pageText != "" {
 					if strings.Contains(lower, "razorpay_signature") ||
 						strings.Contains(lower, "payment successful") ||
-						strings.Contains(lower, "payment_success") {
+						strings.Contains(lower, "payment_success") ||
+						strings.Contains(lower, "payment succeeded") ||
+						strings.Contains(lower, "payment_done") {
 						resp.Charged = true
+						resp.PageText = truncateText(pageText, 300)
+						return nil
 					}
-					return nil
+					if strings.Contains(lower, "payment") && strings.Contains(lower, "failed") {
+						resp.PageText = truncateText(pageText, 300)
+						return nil
+					}
+					if strings.Contains(lower, "transaction failed") ||
+						strings.Contains(lower, "authentication failed") ||
+						strings.Contains(lower, "access denied") {
+						resp.PageText = truncateText(pageText, 300)
+						return nil
+					}
 				}
 
-				time.Sleep(300 * time.Millisecond)
+				onPgRouter := strings.Contains(currentURL, "pg_router") || strings.Contains(currentURL, "authenticate")
+				if !onPgRouter && pageText != "" {
+					if !leftPgRouter {
+						leftPgRouter = true
+						leftPgRouterTime = time.Now()
+					}
+					if time.Since(leftPgRouterTime) > 3*time.Second {
+						resp.PageText = truncateText(pageText, 300)
+						return nil
+					}
+				}
+
+				time.Sleep(500 * time.Millisecond)
+			}
+
+			var finalText string
+			_ = chromedp.Run(pollCtx, chromedp.Text("body", &finalText, chromedp.ByQuery))
+			finalText = strings.TrimSpace(finalText)
+			if finalText != "" {
+				resp.PageText = truncateText(finalText, 300)
+				lower := strings.ToLower(finalText)
+				if strings.Contains(lower, "razorpay_signature") ||
+					strings.Contains(lower, "payment successful") ||
+					strings.Contains(lower, "payment_success") ||
+					strings.Contains(lower, "payment succeeded") {
+					resp.Charged = true
+				}
 			}
 			return nil
 		}),
@@ -217,20 +270,25 @@ func solve3DS(redirectURL, proxyURL string) (resp SolveResponse) {
 				resp.ClosedEarly = true
 			}
 		} else {
-			resp.PageText = strings.TrimSpace(pageText)
-			if len(resp.PageText) > 300 {
-				resp.PageText = resp.PageText[:300]
-			}
+			resp.PageText = truncateText(strings.TrimSpace(pageText), 300)
 			lower := strings.ToLower(resp.PageText)
 			if strings.Contains(lower, "razorpay_signature") ||
 				strings.Contains(lower, "payment successful") ||
-				strings.Contains(lower, "payment_success") {
+				strings.Contains(lower, "payment_success") ||
+				strings.Contains(lower, "payment succeeded") {
 				resp.Charged = true
 			}
 		}
 	}
 
 	return resp
+}
+
+func truncateText(s string, max int) string {
+	if len(s) > max {
+		return s[:max]
+	}
+	return s
 }
 
 // findChrome returns the path to Chrome/Chromium on the system.
