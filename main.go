@@ -7,10 +7,12 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"time"
 
+	"github.com/chromedp/cdproto/fetch"
 	"github.com/chromedp/cdproto/network"
 	"github.com/chromedp/chromedp"
 )
@@ -109,7 +111,37 @@ func writeJSON(w http.ResponseWriter, status int, v interface{}) {
 	json.NewEncoder(w).Encode(v)
 }
 
-func buildAllocatorOpts() []chromedp.ExecAllocatorOption {
+// proxyInfo holds parsed proxy details for Chrome + CDP auth.
+type proxyInfo struct {
+	server   string // host:port for Chrome --proxy-server
+	username string
+	password string
+	hasAuth  bool
+}
+
+func parseProxy(proxyURL string) *proxyInfo {
+	if proxyURL == "" {
+		return nil
+	}
+	parsed, err := url.Parse(proxyURL)
+	if err != nil {
+		return nil
+	}
+	pi := &proxyInfo{
+		server:  parsed.Host,
+		hasAuth: parsed.User != nil,
+	}
+	if pi.hasAuth {
+		pi.username = parsed.User.Username()
+		pi.password, _ = parsed.User.Password()
+	}
+	if pi.server == "" {
+		return nil
+	}
+	return pi
+}
+
+func buildAllocatorOpts(pi *proxyInfo) []chromedp.ExecAllocatorOption {
 	opts := append(chromedp.DefaultExecAllocatorOptions[:],
 		chromedp.Flag("headless", true),
 		chromedp.Flag("no-sandbox", true),
@@ -127,6 +159,11 @@ func buildAllocatorOpts() []chromedp.ExecAllocatorOption {
 	if chromePath := findChrome(); chromePath != "" {
 		opts = append(opts, chromedp.ExecPath(chromePath))
 	}
+
+	if pi != nil && pi.server != "" {
+		opts = append(opts, chromedp.ProxyServer(pi.server))
+	}
+
 	return opts
 }
 
@@ -154,14 +191,35 @@ func solve3DS(redirectURL, proxyURL string) (resp SolveResponse) {
 		}
 	}()
 
+	pi := parseProxy(proxyURL)
+
 	allocCtx, cancelAlloc := chromedp.NewExecAllocator(
 		context.Background(),
-		buildAllocatorOpts()...,
+		buildAllocatorOpts(pi)...,
 	)
 	defer cancelAlloc()
 
 	taskCtx, cancelTask := chromedp.NewContext(allocCtx)
 	defer cancelTask()
+
+	if pi != nil && pi.hasAuth {
+		chromedp.ListenTarget(taskCtx, func(ev interface{}) {
+			switch ev := ev.(type) {
+			case *fetch.EventAuthRequired:
+				go func() {
+					_ = fetch.ContinueWithAuth(ev.RequestID, &fetch.AuthChallengeResponse{
+						Response: fetch.AuthChallengeResponseResponseProvideCredentials,
+						Username: pi.username,
+						Password: pi.password,
+					}).Do(taskCtx)
+				}()
+			case *fetch.EventRequestPaused:
+				go func() {
+					_ = fetch.ContinueRequest(ev.RequestID).Do(taskCtx)
+				}()
+			}
+		})
+	}
 
 	browserCtx, cancelBrowser := context.WithTimeout(taskCtx, 40*time.Second)
 	defer cancelBrowser()
@@ -169,6 +227,9 @@ func solve3DS(redirectURL, proxyURL string) (resp SolveResponse) {
 	navigateErr := chromedp.Run(browserCtx,
 		chromedp.ActionFunc(func(ctx context.Context) error {
 			network.Enable().Do(ctx)
+			if pi != nil && pi.hasAuth {
+				fetch.Enable().WithHandleAuthRequests(true).Do(ctx)
+			}
 			return nil
 		}),
 		chromedp.Navigate(redirectURL),
