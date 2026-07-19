@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -9,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"strings"
 	"time"
 
@@ -141,30 +143,85 @@ func parseProxy(proxyURL string) *proxyInfo {
 	return pi
 }
 
-func buildAllocatorOpts(pi *proxyInfo) []chromedp.ExecAllocatorOption {
-	opts := append(chromedp.DefaultExecAllocatorOptions[:],
-		chromedp.Flag("headless", true),
-		chromedp.Flag("no-sandbox", true),
-		chromedp.Flag("disable-dev-shm-usage", true),
-		chromedp.Flag("disable-web-security", true),
-		chromedp.Flag("disable-blink-features", "AutomationControlled"),
-		chromedp.Flag("disable-gpu", true),
-		chromedp.Flag("ignore-certificate-errors", true),
-		chromedp.Flag("disable-extensions", true),
-		chromedp.Flag("disable-background-networking", true),
-		chromedp.WindowSize(1366, 768),
-		chromedp.UserAgent(solverUserAgent),
-	)
+// startChrome launches a headless Chrome process with remote debugging enabled
+// and returns the process handle, the DevTools WebSocket URL, the temp user-data-dir
+// (for cleanup), and any error.
+//
+// We manage the Chrome process manually instead of using chromedp's ExecAllocator
+// to avoid the "close of closed channel" panic that occurs in chromedp's internal
+// goroutines when the allocator is canceled.
+func startChrome(pi *proxyInfo) (*exec.Cmd, string, string, error) {
+	chromePath := findChrome()
+	if chromePath == "" {
+		return nil, "", "", fmt.Errorf("chrome not found")
+	}
 
-	if chromePath := findChrome(); chromePath != "" {
-		opts = append(opts, chromedp.ExecPath(chromePath))
+	tmpDir, err := os.MkdirTemp("", "chrome-solver-")
+	if err != nil {
+		return nil, "", "", fmt.Errorf("create temp dir: %w", err)
+	}
+
+	args := []string{
+		"--headless=new",
+		"--no-sandbox",
+		"--disable-dev-shm-usage",
+		"--disable-web-security",
+		"--disable-blink-features=AutomationControlled",
+		"--disable-gpu",
+		"--ignore-certificate-errors",
+		"--disable-extensions",
+		"--disable-background-networking",
+		"--no-first-run",
+		"--no-default-browser-check",
+		"--disable-popup-blocking",
+		"--window-size=1366,768",
+		"--user-agent=" + solverUserAgent,
+		"--remote-debugging-port=0",
+		"--user-data-dir=" + tmpDir,
 	}
 
 	if pi != nil && pi.server != "" {
-		opts = append(opts, chromedp.ProxyServer(pi.server))
+		args = append(args, "--proxy-server="+pi.server)
 	}
 
-	return opts
+	cmd := exec.Command(chromePath, args...)
+
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		os.RemoveAll(tmpDir)
+		return nil, "", "", fmt.Errorf("stderr pipe: %w", err)
+	}
+
+	if err := cmd.Start(); err != nil {
+		os.RemoveAll(tmpDir)
+		return nil, "", "", fmt.Errorf("start chrome: %w", err)
+	}
+
+	wsURLChan := make(chan string, 1)
+	go func() {
+		scanner := bufio.NewScanner(stderr)
+		for scanner.Scan() {
+			line := scanner.Text()
+			if idx := strings.Index(line, "ws://"); idx >= 0 {
+				if strings.Contains(line, "DevTools") || strings.Contains(line, "listening") {
+					wsURLChan <- strings.TrimSpace(line[idx:])
+					return
+				}
+			}
+		}
+	}()
+
+	select {
+	case wsURL := <-wsURLChan:
+		return cmd, wsURL, tmpDir, nil
+	case <-time.After(10 * time.Second):
+		if cmd.Process != nil {
+			cmd.Process.Kill()
+		}
+		cmd.Wait()
+		os.RemoveAll(tmpDir)
+		return nil, "", "", fmt.Errorf("timeout waiting for Chrome DevTools URL")
+	}
 }
 
 // solve3DS opens the 3DS redirect URL in a headless browser, waits for the
@@ -193,10 +250,20 @@ func solve3DS(redirectURL, proxyURL string) (resp SolveResponse) {
 
 	pi := parseProxy(proxyURL)
 
-	allocCtx, cancelAlloc := chromedp.NewExecAllocator(
-		context.Background(),
-		buildAllocatorOpts(pi)...,
-	)
+	cmd, wsURL, tmpDir, err := startChrome(pi)
+	if err != nil {
+		resp.Error = fmt.Sprintf("start chrome: %v", err)
+		return resp
+	}
+	defer func() {
+		if cmd.Process != nil {
+			cmd.Process.Kill()
+		}
+		cmd.Wait()
+		os.RemoveAll(tmpDir)
+	}()
+
+	allocCtx, cancelAlloc := chromedp.NewRemoteAllocator(context.Background(), wsURL)
 	defer cancelAlloc()
 
 	taskCtx, cancelTask := chromedp.NewContext(allocCtx)
