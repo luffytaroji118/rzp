@@ -54,6 +54,8 @@ def browser_args_for_platform():
         "--disable-web-security",
         "--disable-blink-features=AutomationControlled",
         "--disable-features=IsolateOrigins,site-per-process",
+        "--ignore-certificate-errors",
+        "--ignore-certificate-errors-spki-list",
     ]
     if platform.system() == "Linux":
         args.extend(["--disable-gpu", "--disable-software-rasterizer"])
@@ -145,6 +147,37 @@ async def solve_3ds(redirect_url: str, proxy_url: str) -> dict:
             page.on("request", on_request)
             page.on("response", on_response)
             page.on("framenavigated", onframenavigated)
+
+            # CDP-level network error capture - Playwright's requestfailed
+            # doesn't always fire for navigation failures, but CDP's
+            # Network.loadingFailed includes the exact errorText
+            # (e.g. ERR_PROXY_CONNECTION_FAILED, ERR_CERT_AUTHORITY_INVALID)
+            try:
+                cdp = await context.new_cdp_session(page)
+                await cdp.send("Network.enable")
+
+                def on_cdp_loading_failed(params):
+                    err_text = params.get("errorText", "unknown")
+                    req_url = params.get("requestId", "")
+                    blocked_reason = params.get("blockedReason", "")
+                    log.warning(
+                        "solve_3ds CDP loadingFailed: errorText=%s blockedReason=%s requestId=%s",
+                        err_text,
+                        blocked_reason,
+                        req_url,
+                    )
+
+                def on_cdp_response_received(params):
+                    resp = params.get("response", {})
+                    status = resp.get("status", 0)
+                    url = resp.get("url", "")
+                    if status >= 400:
+                        log.warning("solve_3ds CDP response %d: %s", status, url)
+
+                cdp.on("Network.loadingFailed", on_cdp_loading_failed)
+                cdp.on("Network.responseReceived", on_cdp_response_received)
+            except Exception as cdp_err:
+                log.warning("solve_3ds CDP setup failed: %s", cdp_err)
 
             # Track popups (bank 3DS page may open in a new window)
             popup_pages = []
