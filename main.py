@@ -17,8 +17,8 @@ logging.basicConfig(
 log = logging.getLogger("solver")
 
 MAX_CONCURRENCY = int(os.environ.get("MAX_CONCURRENCY", "2"))
-TDS_WAIT_SECONDS = int(os.environ.get("TDS_WAIT_SECONDS", "25"))
-NAV_TIMEOUT_MS = 20000
+TDS_WAIT_SECONDS = int(os.environ.get("TDS_WAIT_SECONDS", "15"))
+NAV_TIMEOUT_MS = 15000
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
 _semaphore = asyncio.Semaphore(MAX_CONCURRENCY)
@@ -222,6 +222,9 @@ async def solve_3ds(redirect_url: str, proxy_url: str) -> dict:
                 if "Target closed" in err_str or "browser has been closed" in err_str:
                     page_closed_early = True
                 else:
+                    # Retry after a short delay - ERR_TUNNEL_CONNECTION_FAILED
+                    # is often transient (proxy connection exhaustion)
+                    await page.wait_for_timeout(2000)
                     try:
                         await page.goto(
                             redirect_url,
