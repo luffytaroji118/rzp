@@ -14,7 +14,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/chromedp/cdproto/fetch"
 	"github.com/chromedp/cdproto/network"
 	"github.com/chromedp/chromedp"
 )
@@ -150,6 +149,52 @@ func parseProxy(proxyURL string) *proxyInfo {
 // We manage the Chrome process manually instead of using chromedp's ExecAllocator
 // to avoid the "close of closed channel" panic that occurs in chromedp's internal
 // goroutines when the allocator is canceled.
+// createProxyAuthExtension creates a Chrome extension directory inside the
+// given parent directory that provides proxy authentication credentials.
+// Chrome's --proxy-server flag does not support inline credentials
+// (user:pass@host:port), so we use a Manifest V2 extension with a blocking
+// webRequest onAuthRequired handler. This is the standard approach for
+// authenticated proxies with Chrome/chromedp.
+func createProxyAuthExtension(parentDir string, pi *proxyInfo) (string, error) {
+	extDir := parentDir + "/proxy-auth-ext"
+	if err := os.MkdirAll(extDir, 0755); err != nil {
+		return "", err
+	}
+
+	manifest := `{
+  "version": "1.0.0",
+  "manifest_version": 2,
+  "name": "Proxy Auth",
+  "permissions": ["webRequest", "webRequestBlocking", "proxy"],
+  "host_permissions": ["<all_urls>"],
+  "background": {
+    "scripts": ["background.js"]
+  }
+}`
+
+	bgJS := fmt.Sprintf(`chrome.webRequest.onAuthRequired.addListener(
+  function(details) {
+    return {
+      authCredentials: {
+        username: "%s",
+        password: "%s"
+      }
+    };
+  },
+  { urls: ["<all_urls>"] },
+  ["blocking"]
+);`, pi.username, pi.password)
+
+	if err := os.WriteFile(extDir+"/manifest.json", []byte(manifest), 0644); err != nil {
+		return "", err
+	}
+	if err := os.WriteFile(extDir+"/background.js", []byte(bgJS), 0644); err != nil {
+		return "", err
+	}
+
+	return extDir, nil
+}
+
 func startChrome(pi *proxyInfo) (*exec.Cmd, string, string, error) {
 	chromePath := findChrome()
 	if chromePath == "" {
@@ -169,8 +214,6 @@ func startChrome(pi *proxyInfo) (*exec.Cmd, string, string, error) {
 		"--disable-blink-features=AutomationControlled",
 		"--disable-gpu",
 		"--ignore-certificate-errors",
-		"--disable-extensions",
-		"--disable-background-networking",
 		"--no-first-run",
 		"--no-default-browser-check",
 		"--disable-popup-blocking",
@@ -182,6 +225,18 @@ func startChrome(pi *proxyInfo) (*exec.Cmd, string, string, error) {
 
 	if pi != nil && pi.server != "" {
 		args = append(args, "--proxy-server="+pi.server)
+		if pi.hasAuth {
+			extDir, err := createProxyAuthExtension(tmpDir, pi)
+			if err != nil {
+				os.RemoveAll(tmpDir)
+				return nil, "", "", fmt.Errorf("create proxy auth extension: %w", err)
+			}
+			args = append(args,
+				"--load-extension="+extDir,
+				"--disable-extensions-except="+extDir,
+			)
+			log.Printf("solve3DS: loaded proxy auth extension at %s", extDir)
+		}
 	}
 
 	cmd := exec.Command(chromePath, args...)
@@ -276,25 +331,6 @@ func solve3DS(redirectURL, proxyURL string) (resp SolveResponse) {
 	taskCtx, cancelTask := chromedp.NewContext(allocCtx)
 	defer cancelTask()
 
-	if pi != nil && pi.hasAuth {
-		chromedp.ListenTarget(taskCtx, func(ev interface{}) {
-			switch ev := ev.(type) {
-			case *fetch.EventAuthRequired:
-				go func() {
-					_ = fetch.ContinueWithAuth(ev.RequestID, &fetch.AuthChallengeResponse{
-						Response: fetch.AuthChallengeResponseResponseProvideCredentials,
-						Username: pi.username,
-						Password: pi.password,
-					}).Do(taskCtx)
-				}()
-			case *fetch.EventRequestPaused:
-				go func() {
-					_ = fetch.ContinueRequest(ev.RequestID).Do(taskCtx)
-				}()
-			}
-		})
-	}
-
 	browserCtx, cancelBrowser := context.WithTimeout(taskCtx, 40*time.Second)
 	defer cancelBrowser()
 
@@ -302,13 +338,6 @@ func solve3DS(redirectURL, proxyURL string) (resp SolveResponse) {
 		chromedp.ActionFunc(func(ctx context.Context) error {
 			if err := network.Enable().Do(ctx); err != nil {
 				log.Printf("solve3DS: network.Enable error: %v", err)
-			}
-			if pi != nil && pi.hasAuth {
-				if err := fetch.Enable().WithHandleAuthRequests(true).Do(ctx); err != nil {
-					log.Printf("solve3DS: fetch.Enable error: %v", err)
-				} else {
-					log.Printf("solve3DS: fetch.Enable OK (auth challenges will be handled)")
-				}
 			}
 			return nil
 		}),
