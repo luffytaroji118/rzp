@@ -98,8 +98,10 @@ async def solve_3ds(redirect_url: str, proxy_url: str) -> dict:
             )
             page = await context.new_page()
 
-            # Capture network failures to diagnose chrome-error://chromewebdata/
+            # Capture all network activity to diagnose chrome-error://chromewebdata/
             failed_requests = []
+            all_responses = []
+            all_requests = []
 
             def on_request_failed(req):
                 try:
@@ -114,8 +116,35 @@ async def solve_3ds(redirect_url: str, proxy_url: str) -> dict:
             def on_pageerror(err):
                 log.warning("solve_3ds PAGE ERROR: %s", err)
 
+            def on_request(req):
+                try:
+                    all_requests.append(f"{req.method} {req.url}")
+                    if req.resource_type == "document":
+                        log.info("solve_3ds REQUEST: %s %s (document)", req.method, req.url)
+                except Exception:
+                    pass
+
+            def on_response(resp):
+                try:
+                    all_responses.append(f"{resp.status} {resp.url}")
+                    if resp.status >= 400:
+                        log.warning("solve_3ds RESPONSE %d: %s", resp.status, resp.url)
+                    elif resp.resource_type == "document":
+                        log.info("solve_3ds RESPONSE %d: %s (document)", resp.status, resp.url)
+                except Exception:
+                    pass
+
+            def onframenavigated(frame):
+                try:
+                    log.info("solve_3ds FRAME NAVIGATED: url=%s", frame.url)
+                except Exception:
+                    pass
+
             page.on("requestfailed", on_request_failed)
             page.on("pageerror", on_pageerror)
+            page.on("request", on_request)
+            page.on("response", on_response)
+            page.on("framenavigated", onframenavigated)
 
             try:
                 await page.goto(
@@ -124,6 +153,19 @@ async def solve_3ds(redirect_url: str, proxy_url: str) -> dict:
                     wait_until="domcontentloaded",
                 )
                 log.info("solve_3ds navigate OK")
+                # Capture the initial page content right after navigation
+                # (before JS auto-submit runs) to see if the pg_router form loaded
+                try:
+                    init_html = await page.content()
+                    init_url = page.url
+                    log.info(
+                        "solve_3ds post-nav url=%s html_len=%d preview=%s",
+                        init_url,
+                        len(init_html),
+                        init_html[:300] if init_html else "",
+                    )
+                except Exception as e:
+                    log.warning("solve_3ds post-nav capture error: %s", e)
             except Exception as nav_err:
                 err_str = str(nav_err)
                 log.warning("solve_3ds navigate error: %s", err_str)
