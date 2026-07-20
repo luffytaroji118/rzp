@@ -72,11 +72,19 @@ async def solve_3ds(redirect_url: str, proxy_url: str) -> dict:
       4. Read body inner_text
       5. Detect 'razorpay_signature' / 'payment successful' => charged
     """
-    proxy_config = parse_proxy(proxy_url)
+    # Don't use the proxy for the browser. The proxy causes
+    # ERR_TUNNEL_CONNECTION_FAILED on bank 3DS domains (e.g.
+    # uobm3dsg2.uobgroup.com). The solver is on Railway with a
+    # clean IP — the bank's 3DS page doesn't need to come from
+    # the same IP as the bot's API calls. In a real payment flow,
+    # the customer's browser (which handles 3DS) has a different
+    # IP than the merchant's server anyway.
+    proxy_config = None
+    _provided_proxy = parse_proxy(proxy_url)
     log.info(
-        "solve_3ds start redirect=%s proxy=%s",
+        "solve_3ds start redirect=%s proxy=ignored (was %s)",
         redirect_url,
-        proxy_config.get("server") if proxy_config else "none",
+        _provided_proxy.get("server") if _provided_proxy else "none",
     )
 
     page_text = ""
