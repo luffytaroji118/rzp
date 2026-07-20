@@ -255,33 +255,44 @@ async def solve_3ds(redirect_url: str, proxy_url: str) -> dict:
                                         continue
 
                             if body:
-                                page_text = body
                                 lower = body.lower()
+                                # Detect charge on any page (pg_router or bank)
                                 if "razorpay_signature" in lower or "payment successful" in lower or "payment_success" in lower or "payment succeeded" in lower:
                                     charged = True
+                                    page_text = body
                                     log.info("solve_3ds CHARGED detected at poll#%d", poll_count)
                                     break
-                                # If we're past the pg_router page (bank page loaded),
-                                # wait a bit more then capture final text
-                                if "pg_router" not in cand_url and "about:blank" not in cand_url and "authenticate" not in cand_url:
+                                # If we're still on pg_router/about:blank, do NOT break -
+                                # keep polling for the bank page (form takes ~8s to submit)
+                                if "pg_router" in cand_url or "about:blank" in cand_url or "authenticate" in cand_url:
                                     log.info(
-                                        "solve_3ds poll#%d bank page detected url=%s textLen=%d",
+                                        "solve_3ds poll#%d still on pg_router url=%s textLen=%d",
                                         poll_count,
                                         cand_url,
                                         len(body),
                                     )
-                                    # Give it 2 more seconds to fully render
-                                    try:
-                                        await cand.wait_for_timeout(2000)
-                                        page_text = await cand.locator("body").inner_text(timeout=3000)
-                                        page_text = (page_text or "").strip()
-                                    except Exception:
-                                        pass
-                                    break
+                                    continue
+                                # We're past pg_router - bank page loaded. Capture it.
+                                log.info(
+                                    "solve_3ds poll#%d bank page detected url=%s textLen=%d preview=%s",
+                                    poll_count,
+                                    cand_url,
+                                    len(body),
+                                    body[:80],
+                                )
+                                # Give it 2 more seconds to fully render
+                                try:
+                                    await cand.wait_for_timeout(2000)
+                                    body = await cand.locator("body").inner_text(timeout=3000)
+                                    body = (body or "").strip()
+                                except Exception:
+                                    pass
+                                page_text = body
+                                break
                         except Exception:
                             continue
 
-                    if page_text or charged:
+                    if charged or page_text:
                         break
 
                 log.info(
