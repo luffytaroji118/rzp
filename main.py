@@ -17,8 +17,8 @@ logging.basicConfig(
 log = logging.getLogger("solver")
 
 MAX_CONCURRENCY = int(os.environ.get("MAX_CONCURRENCY", "2"))
-TDS_WAIT_SECONDS = int(os.environ.get("TDS_WAIT_SECONDS", "10"))
-NAV_TIMEOUT_MS = 15000
+TDS_WAIT_SECONDS = int(os.environ.get("TDS_WAIT_SECONDS", "25"))
+NAV_TIMEOUT_MS = 20000
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
 _semaphore = asyncio.Semaphore(MAX_CONCURRENCY)
@@ -146,6 +146,23 @@ async def solve_3ds(redirect_url: str, proxy_url: str) -> dict:
             page.on("response", on_response)
             page.on("framenavigated", onframenavigated)
 
+            # Track popups (bank 3DS page may open in a new window)
+            popup_pages = []
+
+            def on_popup(popup):
+                try:
+                    log.info("solve_3ds POPUP opened url=%s", popup.url)
+                    popup_pages.append(popup)
+                    popup.on("framenavigated", lambda f: log.info("solve_3ds POPUP FRAME NAVIGATED: url=%s", f.url))
+                    popup.on("requestfailed", on_request_failed)
+                    popup.on("pageerror", on_pageerror)
+                    popup.on("request", on_request)
+                    popup.on("response", on_response)
+                except Exception:
+                    pass
+
+            page.on("popup", on_popup)
+
             try:
                 await page.goto(
                     redirect_url,
@@ -182,38 +199,136 @@ async def solve_3ds(redirect_url: str, proxy_url: str) -> dict:
                     except Exception as retry_err:
                         log.warning("solve_3ds navigate retry failed: %s", retry_err)
 
+            # Poll for bank page content across main page, all frames, and popups.
+            # The pg_router page auto-submits a form after ~8s that opens the bank
+            # 3DS page (sometimes in a popup, sometimes in an iframe, sometimes as
+            # a full navigation). A single blind wait misses it; we poll instead.
             if not page_closed_early:
-                try:
-                    await page.wait_for_timeout(TDS_WAIT_SECONDS * 1000)
-                    page_text = await page.locator("body").inner_text()
-                    log.info(
-                        "solve_3ds after wait textLen=%d preview=%s",
-                        len(page_text),
-                        page_text[:120] if page_text else "",
-                    )
-                except Exception as wait_err:
-                    err_str = str(wait_err)
-                    if "Target closed" in err_str or "browser has been closed" in err_str:
-                        page_closed_early = True
-                        log.info("solve_3ds page closed early during wait")
-                    else:
-                        try:
-                            page_text = await page.locator("body").inner_text()
-                        except Exception:
-                            page_text = ""
+                import time as _time
+                deadline = _time.monotonic() + TDS_WAIT_SECONDS
+                last_url = ""
+                poll_count = 0
+                while _time.monotonic() < deadline:
+                    poll_count += 1
+                    try:
+                        await page.wait_for_timeout(1000)
+                    except Exception:
+                        pass
 
-            # Diagnose chrome-error://chromewebdata/ - capture page title, URL, and HTML
+                    candidates = [page] + list(popup_pages)
+                    for cand in candidates:
+                        try:
+                            if cand.is_closed():
+                                continue
+                            cand_url = cand.url
+                            # Log URL changes
+                            if cand_url != last_url:
+                                log.info("solve_3ds poll#%d url=%s", poll_count, cand_url)
+                                last_url = cand_url
+
+                            # Check main frame body text
+                            try:
+                                body = await cand.locator("body").inner_text(timeout=2000)
+                            except Exception:
+                                body = ""
+                            body = (body or "").strip()
+
+                            # Check all child frames
+                            if not body:
+                                for frame in cand.frames:
+                                    if frame == cand.main_frame:
+                                        continue
+                                    try:
+                                        fbody = await frame.locator("body").inner_text(timeout=1500)
+                                        fbody = (fbody or "").strip()
+                                        if fbody:
+                                            log.info(
+                                                "solve_3ds poll#%d frame url=%s textLen=%d preview=%s",
+                                                poll_count,
+                                                frame.url,
+                                                len(fbody),
+                                                fbody[:80],
+                                            )
+                                            body = fbody
+                                            break
+                                    except Exception:
+                                        continue
+
+                            if body:
+                                page_text = body
+                                lower = body.lower()
+                                if "razorpay_signature" in lower or "payment successful" in lower or "payment_success" in lower or "payment succeeded" in lower:
+                                    charged = True
+                                    log.info("solve_3ds CHARGED detected at poll#%d", poll_count)
+                                    break
+                                # If we're past the pg_router page (bank page loaded),
+                                # wait a bit more then capture final text
+                                if "pg_router" not in cand_url and "about:blank" not in cand_url and "authenticate" not in cand_url:
+                                    log.info(
+                                        "solve_3ds poll#%d bank page detected url=%s textLen=%d",
+                                        poll_count,
+                                        cand_url,
+                                        len(body),
+                                    )
+                                    # Give it 2 more seconds to fully render
+                                    try:
+                                        await cand.wait_for_timeout(2000)
+                                        page_text = await cand.locator("body").inner_text(timeout=3000)
+                                        page_text = (page_text or "").strip()
+                                    except Exception:
+                                        pass
+                                    break
+                        except Exception:
+                            continue
+
+                    if page_text or charged:
+                        break
+
+                log.info(
+                    "solve_3ds poll ended after %d polls textLen=%d charged=%s",
+                    poll_count,
+                    len(page_text or ""),
+                    charged,
+                )
+
+            # Final diagnostics: capture URL, title, HTML from main page + popups
             try:
                 final_url = page.url
                 title = await page.title()
                 log.info("solve_3ds final url=%s title=%s", final_url, title)
-                if "chrome-error" in final_url or not page_text:
+
+                # Also log popup states
+                for i, popup in enumerate(popup_pages):
+                    try:
+                        if popup.is_closed():
+                            log.info("solve_3ds popup#%d CLOSED", i)
+                        else:
+                            p_url = popup.url
+                            p_title = await popup.title()
+                            log.info("solve_3ds popup#%d url=%s title=%s", i, p_url, p_title)
+                    except Exception:
+                        pass
+
+                if not page_text:
                     html = await page.content()
                     log.warning(
-                        "solve_3ds ERROR PAGE html_len=%d preview=%s",
+                        "solve_3ds no text - main html_len=%d preview=%s",
                         len(html),
                         html[:500] if html else "",
                     )
+                    # Check popup HTML too
+                    for i, popup in enumerate(popup_pages):
+                        try:
+                            if not popup.is_closed():
+                                p_html = await popup.content()
+                                log.warning(
+                                    "solve_3ds popup#%d html_len=%d preview=%s",
+                                    i,
+                                    len(p_html),
+                                    p_html[:300] if p_html else "",
+                                )
+                        except Exception:
+                            pass
                     if failed_requests:
                         log.warning(
                             "solve_3ds FAILED REQUESTS: %s",
@@ -221,11 +336,6 @@ async def solve_3ds(redirect_url: str, proxy_url: str) -> dict:
                         )
             except Exception as diag_err:
                 log.warning("solve_3ds diag error: %s", diag_err)
-
-            lower = (page_text or "").lower()
-            if "razorpay_signature" in lower or "payment successful" in lower or "payment_success" in lower or "payment succeeded" in lower:
-                charged = True
-                log.info("solve_3ds CHARGED detected")
 
             try:
                 await browser.close()
