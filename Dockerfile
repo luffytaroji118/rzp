@@ -1,26 +1,25 @@
-FROM golang:1.26-alpine AS builder
+FROM python:3.12-slim
 
 WORKDIR /app
 
-COPY go.mod go.sum ./
-RUN go mod download
+# Install system dependencies required by Playwright Chromium.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
 
-COPY main.go .
-RUN CGO_ENABLED=0 GOOS=linux go build -o /app/solver .
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
 
-FROM alpine:latest
+# Install Playwright Chromium browser and its OS dependencies.
+RUN playwright install chromium --with-deps
 
-RUN apk add --no-cache ca-certificates tzdata \
-    chromium nss freetype harfbuzz ttf-freefont \
-    && addgroup -S solver && adduser -S solver -G solver
+COPY main.py .
 
-ENV CHROME_BIN=/usr/bin/chromium-browser
-
-WORKDIR /app
-COPY --from=builder /app/solver .
-
+# Create non-root user for security.
+RUN useradd -m solver
 USER solver
 
+ENV PORT=8080
 EXPOSE 8080
 
-CMD ["./solver"]
+CMD ["python", "main.py"]

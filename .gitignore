@@ -1,7 +1,6 @@
-*.exe
-*.dll
-*.so
-*.dylib
-*.test
-*.out
+__pycache__/
+*.pyc
+*.pyo
 .env
+.venv/
+venv/
