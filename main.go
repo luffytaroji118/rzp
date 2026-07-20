@@ -249,12 +249,19 @@ func solve3DS(redirectURL, proxyURL string) (resp SolveResponse) {
 	}()
 
 	pi := parseProxy(proxyURL)
+	if pi != nil {
+		log.Printf("solve3DS: proxy=%s hasAuth=%v redirect=%s", pi.server, pi.hasAuth, redirectURL)
+	} else {
+		log.Printf("solve3DS: no proxy redirect=%s", redirectURL)
+	}
 
 	cmd, wsURL, tmpDir, err := startChrome(pi)
 	if err != nil {
 		resp.Error = fmt.Sprintf("start chrome: %v", err)
+		log.Printf("solve3DS: startChrome failed: %v", err)
 		return resp
 	}
+	log.Printf("solve3DS: chrome started wsURL=%s", wsURL)
 	defer func() {
 		if cmd.Process != nil {
 			cmd.Process.Kill()
@@ -293,9 +300,15 @@ func solve3DS(redirectURL, proxyURL string) (resp SolveResponse) {
 
 	navigateErr := chromedp.Run(browserCtx,
 		chromedp.ActionFunc(func(ctx context.Context) error {
-			network.Enable().Do(ctx)
+			if err := network.Enable().Do(ctx); err != nil {
+				log.Printf("solve3DS: network.Enable error: %v", err)
+			}
 			if pi != nil && pi.hasAuth {
-				fetch.Enable().WithHandleAuthRequests(true).Do(ctx)
+				if err := fetch.Enable().WithHandleAuthRequests(true).Do(ctx); err != nil {
+					log.Printf("solve3DS: fetch.Enable error: %v", err)
+				} else {
+					log.Printf("solve3DS: fetch.Enable OK (auth challenges will be handled)")
+				}
 			}
 			return nil
 		}),
@@ -303,12 +316,15 @@ func solve3DS(redirectURL, proxyURL string) (resp SolveResponse) {
 	)
 
 	if navigateErr != nil {
+		log.Printf("solve3DS: navigate error: %v", navigateErr)
 		errStr := navigateErr.Error()
 		if strings.Contains(errStr, "Target closed") || strings.Contains(errStr, "browser has been closed") {
 			resp.ClosedEarly = true
 			return resp
 		}
 		_ = chromedp.Run(browserCtx, chromedp.Navigate(redirectURL))
+	} else {
+		log.Printf("solve3DS: navigate OK")
 	}
 
 	waitCtx, cancelWait := context.WithTimeout(browserCtx, 37*time.Second)
@@ -328,12 +344,20 @@ func solve3DS(redirectURL, proxyURL string) (resp SolveResponse) {
 				}
 
 				var currentURL string
-				_ = chromedp.Run(pollCtx, chromedp.Location(&currentURL))
+				if err := chromedp.Run(pollCtx, chromedp.Location(&currentURL)); err != nil {
+					log.Printf("solve3DS: poll Location error: %v", err)
+				}
 
 				var pageText string
-				_ = chromedp.Run(pollCtx, chromedp.Text("body", &pageText, chromedp.ByQuery))
+				if err := chromedp.Run(pollCtx, chromedp.Text("body", &pageText, chromedp.ByQuery)); err != nil {
+					log.Printf("solve3DS: poll Text error: %v", err)
+				}
 				pageText = strings.TrimSpace(pageText)
 				lower := strings.ToLower(pageText)
+
+				if pageText != "" && len(pageText) > 0 {
+					log.Printf("solve3DS: poll url=%s textLen=%d textPreview=%s", currentURL, len(pageText), truncateText(pageText, 80))
+				}
 
 				if pageText != "" {
 					if strings.Contains(lower, "razorpay_signature") ||
@@ -373,7 +397,22 @@ func solve3DS(redirectURL, proxyURL string) (resp SolveResponse) {
 			}
 
 			var finalText string
-			_ = chromedp.Run(pollCtx, chromedp.Text("body", &finalText, chromedp.ByQuery))
+			if err := chromedp.Run(pollCtx, chromedp.Text("body", &finalText, chromedp.ByQuery)); err != nil {
+				log.Printf("solve3DS: final Text error: %v", err)
+			}
+
+			var finalURL string
+			_ = chromedp.Run(pollCtx, chromedp.Location(&finalURL))
+			log.Printf("solve3DS: poll ended url=%s textLen=%d", finalURL, len(finalText))
+
+			var finalHTML string
+			_ = chromedp.Run(pollCtx, chromedp.OuterHTML("html", &finalHTML, chromedp.ByQuery))
+			if finalHTML != "" {
+				log.Printf("solve3DS: final HTML len=%d preview=%s", len(finalHTML), truncateText(finalHTML, 200))
+			} else {
+				log.Printf("solve3DS: final HTML empty - Chrome may not have loaded any page")
+			}
+
 			finalText = strings.TrimSpace(finalText)
 			if finalText != "" {
 				resp.PageText = truncateText(finalText, 300)
