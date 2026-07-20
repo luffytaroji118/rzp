@@ -98,6 +98,25 @@ async def solve_3ds(redirect_url: str, proxy_url: str) -> dict:
             )
             page = await context.new_page()
 
+            # Capture network failures to diagnose chrome-error://chromewebdata/
+            failed_requests = []
+
+            def on_request_failed(req):
+                try:
+                    url = req.url
+                    failure = req.failure
+                    err_text = failure.error_text if failure else "unknown"
+                    failed_requests.append(f"{url} -> {err_text}")
+                    log.warning("solve_3ds REQUEST FAILED: %s -> %s", url, err_text)
+                except Exception:
+                    pass
+
+            def on_pageerror(err):
+                log.warning("solve_3ds PAGE ERROR: %s", err)
+
+            page.on("requestfailed", on_request_failed)
+            page.on("pageerror", on_pageerror)
+
             try:
                 await page.goto(
                     redirect_url,
@@ -141,16 +160,30 @@ async def solve_3ds(redirect_url: str, proxy_url: str) -> dict:
                         except Exception:
                             page_text = ""
 
+            # Diagnose chrome-error://chromewebdata/ - capture page title, URL, and HTML
+            try:
+                final_url = page.url
+                title = await page.title()
+                log.info("solve_3ds final url=%s title=%s", final_url, title)
+                if "chrome-error" in final_url or not page_text:
+                    html = await page.content()
+                    log.warning(
+                        "solve_3ds ERROR PAGE html_len=%d preview=%s",
+                        len(html),
+                        html[:500] if html else "",
+                    )
+                    if failed_requests:
+                        log.warning(
+                            "solve_3ds FAILED REQUESTS: %s",
+                            "; ".join(failed_requests[:5]),
+                        )
+            except Exception as diag_err:
+                log.warning("solve_3ds diag error: %s", diag_err)
+
             lower = (page_text or "").lower()
             if "razorpay_signature" in lower or "payment successful" in lower or "payment_success" in lower or "payment succeeded" in lower:
                 charged = True
                 log.info("solve_3ds CHARGED detected")
-
-            try:
-                current_url = page.url
-                log.info("solve_3ds final url=%s", current_url)
-            except Exception:
-                pass
 
             try:
                 await browser.close()
