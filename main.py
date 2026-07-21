@@ -16,10 +16,98 @@ logging.basicConfig(
 )
 log = logging.getLogger("solver")
 
-MAX_CONCURRENCY = int(os.environ.get("MAX_CONCURRENCY", "2"))
-TDS_WAIT_SECONDS = int(os.environ.get("TDS_WAIT_SECONDS", "15"))
+MAX_CONCURRENCY = int(os.environ.get("MAX_CONCURRENCY", "3"))
+TDS_WAIT_SECONDS = int(os.environ.get("TDS_WAIT_SECONDS", "25"))
 NAV_TIMEOUT_MS = 15000
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+
+# Bank 3DS page indicators. If ANY of these appear in the page URL or body
+# text, the browser has reached the issuer's 3DS challenge page — the card is
+# LIVE and requires OTP. The bot treats this as APPROVED immediately.
+BANK_3DS_URL_PATTERNS = (
+    "arcot.com",
+    "m2pfintech.com",
+    "uobgroup.com",
+    "hdfcbank.com",
+    "icicibank.com",
+    "sbicard.com",
+    "axisbank.co.in",
+    "axisbank.com",
+    "3dsecure",
+    "acs.",
+    "acs1.",
+    "acs2.",
+    "acs3.",
+    "acs-",
+    "mastercard.com",
+    "visa.com",
+    "verifiedbyvisa",
+    "mastercardsecurecode",
+    "bankofbaroda",
+    "kotak",
+    "idbibank",
+    "yesbank",
+    "federalbank",
+    "citisfhh",
+    "canarabank",
+    "pnb.co.in",
+    "unionbankofindia",
+    "indianbank",
+    "bankofindia",
+    "centralbankofindia",
+    "rupeepay",
+    "rupay.in",
+    "billdesk",
+    "atomtech",
+    "techprocess",
+    "easypay",
+    "bharatbillpay",
+)
+
+BANK_3DS_TEXT_PATTERNS = (
+    "verify your purchase",
+    "transaction verification",
+    "we have sent the secure online code",
+    "we have sent the secure code",
+    "getting your verification method",
+    "enter otp",
+    "enter the otp",
+    "one time password",
+    "one-time password",
+    "secure online",
+    "3d secure",
+    "3ds authentication",
+    "mastercard securecode",
+    "verified by visa",
+    "verified by mastercard",
+    "please enter the otp",
+    "secure online shopping",
+    "cardholder authentication",
+    "verify your identity",
+    "authentication required",
+    "secure payment system",
+    "pinnacle epg",
+    "enroll for 3d secure",
+    "3-secure",
+    "threedsecure",
+    "payer authentication",
+    "acs challenge",
+    "bank's verification",
+)
+
+# "Payment in progress" indicators — Razorpay's status-polling page that
+# appears when the bank is doing backend frictionless 3DS. The page polls
+# Razorpay via XHR; we can't see those results from the URL/body. The bot
+# will retry the status API a few times when it sees this.
+PAYMENT_IN_PROGRESS_TEXT_PATTERNS = (
+    "payment in progress",
+    "payment is being processed",
+    "processing your payment",
+    "please wait while we process",
+    "don't refresh the page",
+    "we are processing your payment",
+    "please wait... completing payment",
+)
 
 _semaphore = asyncio.Semaphore(MAX_CONCURRENCY)
 _playwright = None
@@ -62,6 +150,30 @@ def browser_args_for_platform():
     return args
 
 
+def is_bank_3ds_url(url: str) -> bool:
+    """Return True if the URL looks like an issuer's 3DS ACS page."""
+    if not url:
+        return False
+    low = url.lower()
+    return any(p in low for p in BANK_3DS_URL_PATTERNS)
+
+
+def is_bank_3ds_text(text: str) -> bool:
+    """Return True if the page body text looks like a 3DS challenge page."""
+    if not text:
+        return False
+    low = text.lower()
+    return any(p in low for p in BANK_3DS_TEXT_PATTERNS)
+
+
+def is_payment_in_progress_text(text: str) -> bool:
+    """Return True if the page body text indicates Razorpay's status-polling page."""
+    if not text:
+        return False
+    low = text.lower()
+    return any(p in low for p in PAYMENT_IN_PROGRESS_TEXT_PATTERNS)
+
+
 async def solve_3ds(redirect_url: str, proxy_url: str) -> dict:
     """Navigate to the 3DS redirect URL, wait for the bank page, and return the result.
 
@@ -90,6 +202,8 @@ async def solve_3ds(redirect_url: str, proxy_url: str) -> dict:
     page_text = ""
     page_closed_early = False
     charged = False
+    bank_3ds = False
+    payment_in_progress = False
     error_msg = ""
 
     browser = None
@@ -127,10 +241,29 @@ async def solve_3ds(redirect_url: str, proxy_url: str) -> dict:
                 log.warning("solve_3ds PAGE ERROR: %s", err)
 
             def on_request(req):
+                nonlocal charged, page_text
                 try:
                     all_requests.append(f"{req.method} {req.url}")
                     if req.resource_type == "document":
                         log.info("solve_3ds REQUEST: %s %s (document)", req.method, req.url)
+                    # Intercept POST requests to callback URLs - the
+                    # razorpay_signature is in the POST body, not the page
+                    # text. The callback URL (test-url.razorpay.com) doesn't
+                    # resolve, so the page never loads - but the POST body
+                    # contains the signature proving the payment was charged.
+                    if req.method == "POST":
+                        try:
+                            post_data = req.post_data
+                            if post_data and "razorpay_signature" in post_data:
+                                charged = True
+                                page_text = post_data[:500]
+                                log.info(
+                                    "solve_3ds CHARGED detected in POST body to %s: %s",
+                                    req.url,
+                                    post_data[:200],
+                                )
+                        except Exception:
+                            pass
                 except Exception:
                     pass
 
@@ -252,6 +385,7 @@ async def solve_3ds(redirect_url: str, proxy_url: str) -> dict:
                 deadline = _time.monotonic() + TDS_WAIT_SECONDS
                 last_url = ""
                 poll_count = 0
+                pip_logged = False
                 while _time.monotonic() < deadline:
                     poll_count += 1
                     try:
@@ -269,6 +403,17 @@ async def solve_3ds(redirect_url: str, proxy_url: str) -> dict:
                             if cand_url != last_url:
                                 log.info("solve_3ds poll#%d url=%s", poll_count, cand_url)
                                 last_url = cand_url
+
+                            # Fast path: if the URL itself is a known bank 3DS
+                            # ACS domain, flag it immediately even before the
+                            # body finishes rendering.
+                            if is_bank_3ds_url(cand_url):
+                                bank_3ds = True
+                                log.info(
+                                    "solve_3ds BANK_3DS url-match poll#%d url=%s",
+                                    poll_count,
+                                    cand_url,
+                                )
 
                             # Check main frame body text
                             try:
@@ -294,6 +439,8 @@ async def solve_3ds(redirect_url: str, proxy_url: str) -> dict:
                                                 fbody[:80],
                                             )
                                             body = fbody
+                                            if is_bank_3ds_url(frame.url):
+                                                bank_3ds = True
                                             break
                                     except Exception:
                                         continue
@@ -306,6 +453,41 @@ async def solve_3ds(redirect_url: str, proxy_url: str) -> dict:
                                     page_text = body
                                     log.info("solve_3ds CHARGED detected at poll#%d", poll_count)
                                     break
+                                # Detect bank 3DS challenge page by text content
+                                if is_bank_3ds_text(body):
+                                    bank_3ds = True
+                                    page_text = body
+                                    log.info(
+                                        "solve_3ds BANK_3DS text-match poll#%d url=%s textLen=%d preview=%s",
+                                        poll_count,
+                                        cand_url,
+                                        len(body),
+                                        body[:80],
+                                    )
+                                    # Give it 1 more second to fully render, then break
+                                    try:
+                                        await cand.wait_for_timeout(1000)
+                                        body2 = await cand.locator("body").inner_text(timeout=2000)
+                                        if body2:
+                                            page_text = (body2 or "").strip()
+                                    except Exception:
+                                        pass
+                                    break
+                                # Detect Razorpay "Payment in progress" page (frictionless
+                                # processing). Don't break — keep polling in case it
+                                # transitions to charged or a bank page.
+                                if is_payment_in_progress_text(body):
+                                    payment_in_progress = True
+                                    if not pip_logged:
+                                        log.info(
+                                            "solve_3ds PAYMENT_IN_PROGRESS poll#%d url=%s textLen=%d",
+                                            poll_count,
+                                            cand_url,
+                                            len(body),
+                                        )
+                                        pip_logged = True
+                                    page_text = body
+                                    continue
                                 # If we're still on pg_router/about:blank, do NOT break -
                                 # keep polling for the bank page (form takes ~8s to submit)
                                 if "pg_router" in cand_url or "about:blank" in cand_url or "authenticate" in cand_url:
@@ -316,9 +498,21 @@ async def solve_3ds(redirect_url: str, proxy_url: str) -> dict:
                                         len(body),
                                     )
                                     continue
-                                # We're past pg_router - bank page loaded. Capture it.
+                                # We're past pg_router - some page loaded. If the URL
+                                # is a known bank 3DS domain, treat as bank_3ds.
+                                if bank_3ds:
+                                    page_text = body
+                                    log.info(
+                                        "solve_3ds poll#%d bank 3ds page captured url=%s textLen=%d preview=%s",
+                                        poll_count,
+                                        cand_url,
+                                        len(body),
+                                        body[:80],
+                                    )
+                                    break
+                                # Otherwise capture it as an unknown bank page
                                 log.info(
-                                    "solve_3ds poll#%d bank page detected url=%s textLen=%d preview=%s",
+                                    "solve_3ds poll#%d page detected url=%s textLen=%d preview=%s",
                                     poll_count,
                                     cand_url,
                                     len(body),
@@ -336,14 +530,16 @@ async def solve_3ds(redirect_url: str, proxy_url: str) -> dict:
                         except Exception:
                             continue
 
-                    if charged or page_text:
+                    if charged or bank_3ds or page_text:
                         break
 
                 log.info(
-                    "solve_3ds poll ended after %d polls textLen=%d charged=%s",
+                    "solve_3ds poll ended after %d polls textLen=%d charged=%s bank_3ds=%s pip=%s",
                     poll_count,
                     len(page_text or ""),
                     charged,
+                    bank_3ds,
+                    payment_in_progress,
                 )
 
             # Final diagnostics: capture URL, title, HTML from main page + popups
@@ -351,6 +547,21 @@ async def solve_3ds(redirect_url: str, proxy_url: str) -> dict:
                 final_url = page.url
                 title = await page.title()
                 log.info("solve_3ds final url=%s title=%s", final_url, title)
+
+                # Last-chance bank 3DS detection: the polling loop may have
+                # ended with empty body text (Chromium sometimes returns empty
+                # inner_text while the page is still rendering). If the final
+                # URL or page title matches a known bank 3DS pattern, flag it.
+                if not bank_3ds and not charged:
+                    if is_bank_3ds_url(final_url) or is_bank_3ds_text(title):
+                        bank_3ds = True
+                        log.info(
+                            "solve_3ds BANK_3DS final-check url=%s title=%s",
+                            final_url,
+                            title,
+                        )
+                        if not page_text:
+                            page_text = title or final_url
 
                 # Also log popup states
                 for i, popup in enumerate(popup_pages):
@@ -361,6 +572,18 @@ async def solve_3ds(redirect_url: str, proxy_url: str) -> dict:
                             p_url = popup.url
                             p_title = await popup.title()
                             log.info("solve_3ds popup#%d url=%s title=%s", i, p_url, p_title)
+                            # Check popup for bank 3DS too
+                            if not bank_3ds and not charged:
+                                if is_bank_3ds_url(p_url) or is_bank_3ds_text(p_title):
+                                    bank_3ds = True
+                                    log.info(
+                                        "solve_3ds BANK_3DS popup#%d url=%s title=%s",
+                                        i,
+                                        p_url,
+                                        p_title,
+                                    )
+                                    if not page_text:
+                                        page_text = p_title or p_url
                     except Exception:
                         pass
 
@@ -414,14 +637,18 @@ async def solve_3ds(redirect_url: str, proxy_url: str) -> dict:
 
     result = {
         "charged": charged,
+        "bank_3ds": bank_3ds,
+        "payment_in_progress": payment_in_progress,
         "page_text": (page_text or "").strip()[:300],
         "closed_early": page_closed_early,
     }
     if error_msg:
         result["error"] = error_msg
     log.info(
-        "solve_3ds done charged=%s closed_early=%s textLen=%d",
+        "solve_3ds done charged=%s bank_3ds=%s pip=%s closed_early=%s textLen=%d",
         charged,
+        bank_3ds,
+        payment_in_progress,
         page_closed_early,
         len(result["page_text"]),
     )
